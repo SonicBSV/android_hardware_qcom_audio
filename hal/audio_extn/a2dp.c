@@ -1,5 +1,5 @@
 /*
-* Copyright (c) 2015-2019, The Linux Foundation. All rights reserved.
+* Copyright (c) 2015-2020, The Linux Foundation. All rights reserved.
 *
 * Redistribution and use in source and binary forms, with or without
 * modification, are permitted provided that the following conditions are
@@ -49,7 +49,6 @@
 #include <log_utils.h>
 #endif
 
-#define AUDIO_PARAMETER_A2DP_STARTED "A2dpStarted"
 #define BT_IPC_SOURCE_LIB_NAME "btaudio_offload_if.so"
 #define BT_IPC_SINK_LIB_NAME    "libbthost_if_sink.so"
 #define MEDIA_FMT_NONE                                     0
@@ -91,13 +90,7 @@
 #define MIXER_SET_FEEDBACK_CHANNEL "BT set feedback channel"
 #define MIXER_SINK_SAMPLE_RATE     "BT_TX SampleRate"
 #define MIXER_AFE_SINK_CHANNELS    "AFE Output Channels"
-#define MIXER_ENC_FMT_SBC          "SBC"
-#define MIXER_ENC_FMT_AAC          "AAC"
-#define MIXER_ENC_FMT_APTX         "APTX"
 #define MIXER_FMT_TWS_CHANNEL_MODE "TWS Channel Mode"
-#define MIXER_ENC_FMT_APTXHD       "APTXHD"
-#define MIXER_END_FMT_LDAC         "LDAC"
-#define MIXER_ENC_FMT_NONE         "NONE"
 #define ENCODER_LATENCY_SBC        10
 #define ENCODER_LATENCY_APTX       40
 #define ENCODER_LATENCY_APTX_HD    20
@@ -257,6 +250,7 @@ typedef enum {
 typedef enum {
     MTU_SIZE,
     PEAK_BIT_RATE,
+    BIT_RATE_MODE,
 } frame_control_type_t;
 
 // --- external function dependency ---
@@ -397,6 +391,7 @@ struct aac_frame_size_control_t {
     /* Control value
      * MTU_SIZE: MTU size in bytes
      * PEAK_BIT_RATE: Peak bitrate in bits per second.
+     * BIT_RATE_MODE: Variable bitrate
      */
     uint32_t ctl_value;
 };
@@ -456,6 +451,12 @@ struct aac_enc_cfg_t {
 struct aac_enc_cfg_v2_t {
     struct aac_enc_cfg_t aac_enc_cfg;
     struct aac_frame_size_control_t frame_ctl;
+} __attribute__ ((packed));
+
+struct aac_enc_cfg_v3_t {
+    struct aac_enc_cfg_t aac_enc_cfg;
+    struct aac_frame_size_control_t frame_ctl;
+    struct aac_frame_size_control_t aac_key_value_ctl;
 } __attribute__ ((packed));
 
 typedef struct audio_aac_decoder_config_t audio_aac_decoder_config_t;
@@ -716,6 +717,13 @@ typedef struct {
     audio_aac_encoder_config audio_aac_enc_cfg;
     struct aac_frame_size_control_t frame_ctl;
 } audio_aac_encoder_config_v2;
+
+typedef struct {
+    audio_aac_encoder_config audio_aac_enc_cfg;
+    struct aac_frame_size_control_t frame_ctl;
+    uint8_t size_control_struct;
+    struct aac_frame_size_control_t* frame_ptr_ctl;
+} audio_aac_encoder_config_v3;
 
 /* Information about BT CELT encoder configuration
  * This data is used between audio HAL module and
@@ -2180,6 +2188,76 @@ fail:
     return is_configured;
 }
 
+bool configure_aac_enc_format_v3(audio_aac_encoder_config_v3 *aac_bt_cfg)
+{
+    struct mixer_ctl *ctl_enc_data = NULL;
+    struct aac_enc_cfg_v3_t aac_dsp_cfg;
+    struct aac_frame_size_control_t* frame_vbr_ctl = NULL;
+    bool is_configured = false;
+    int ret = 0;
+
+    if (aac_bt_cfg == NULL)
+        return false;
+
+    ctl_enc_data = mixer_get_ctl_by_name(a2dp.adev->mixer, MIXER_ENC_CONFIG_BLOCK);
+    if (!ctl_enc_data) {
+        ALOGE(" ERROR  a2dp encoder CONFIG data mixer control not identifed");
+        is_configured = false;
+        goto fail;
+    }
+    memset(&aac_dsp_cfg, 0x0, sizeof(struct aac_enc_cfg_v3_t));
+    aac_dsp_cfg.aac_enc_cfg.enc_format = MEDIA_FMT_AAC;
+    aac_dsp_cfg.aac_enc_cfg.bit_rate = aac_bt_cfg->audio_aac_enc_cfg.bitrate;
+    aac_dsp_cfg.aac_enc_cfg.sample_rate = aac_bt_cfg->audio_aac_enc_cfg.sampling_rate;
+    switch (aac_bt_cfg->audio_aac_enc_cfg.enc_mode) {
+        case 0:
+            aac_dsp_cfg.aac_enc_cfg.enc_mode = MEDIA_FMT_AAC_AOT_LC;
+            break;
+        case 2:
+            aac_dsp_cfg.aac_enc_cfg.enc_mode = MEDIA_FMT_AAC_AOT_PS;
+            break;
+        case 1:
+        default:
+            aac_dsp_cfg.aac_enc_cfg.enc_mode = MEDIA_FMT_AAC_AOT_SBR;
+            break;
+    }
+    aac_dsp_cfg.aac_enc_cfg.aac_fmt_flag = aac_bt_cfg->audio_aac_enc_cfg.format_flag;
+    aac_dsp_cfg.aac_enc_cfg.channel_cfg = aac_bt_cfg->audio_aac_enc_cfg.channels;
+    aac_dsp_cfg.frame_ctl.ctl_type = aac_bt_cfg->frame_ctl.ctl_type;
+    aac_dsp_cfg.frame_ctl.ctl_value = aac_bt_cfg->frame_ctl.ctl_value;
+    frame_vbr_ctl =  aac_bt_cfg->frame_ptr_ctl;
+
+    if (frame_vbr_ctl != NULL) {
+        aac_dsp_cfg.aac_key_value_ctl.ctl_type = frame_vbr_ctl->ctl_type;
+        aac_dsp_cfg.aac_key_value_ctl.ctl_value = frame_vbr_ctl->ctl_value;
+    } else {
+        ALOGE("%s: VBR cannot be enabled, fall back to default",__func__);
+        aac_dsp_cfg.aac_key_value_ctl.ctl_type = 0;
+        aac_dsp_cfg.aac_key_value_ctl.ctl_value = 0;
+    }
+
+    ret = mixer_ctl_set_array(ctl_enc_data, (void *)&aac_dsp_cfg,
+                              sizeof(struct aac_enc_cfg_v3_t));
+    if (ret != 0) {
+        ALOGE("%s: Failed to set AAC encoder config", __func__);
+        is_configured = false;
+        goto fail;
+    }
+    ret = a2dp_set_bit_format(aac_bt_cfg->audio_aac_enc_cfg.bits_per_sample);
+    if (ret != 0) {
+        is_configured = false;
+        goto fail;
+    }
+    is_configured = true;
+    a2dp.bt_encoder_format = CODEC_TYPE_AAC;
+    a2dp.enc_sampling_rate = aac_bt_cfg->audio_aac_enc_cfg.sampling_rate;
+    a2dp.enc_channels = aac_bt_cfg->audio_aac_enc_cfg.channels;
+    ALOGV("%s: Successfully updated AAC enc format with sampling rate: %d channels:%d",
+           __func__, aac_dsp_cfg.aac_enc_cfg.sample_rate, aac_dsp_cfg.aac_enc_cfg.channel_cfg);
+fail:
+    return is_configured;
+}
+
 bool configure_celt_enc_format(audio_celt_encoder_config *celt_bt_cfg)
 {
     struct mixer_ctl *ctl_enc_data = NULL;
@@ -2368,11 +2446,16 @@ bool configure_a2dp_encoder_format()
 #endif
         case CODEC_TYPE_AAC:
             ALOGD(" Received AAC encoder supported BT device");
+            bool is_aac_vbr_enabled =
+                    property_get_bool("persist.vendor.bt.aac_vbr_frm_ctl.enabled", false);
             bool is_aac_frame_ctl_enabled =
                     property_get_bool("persist.vendor.bt.aac_frm_ctl.enabled", false);
-            is_configured = is_aac_frame_ctl_enabled ?
-                  configure_aac_enc_format_v2((audio_aac_encoder_config_v2 *) codec_info) :
-                  configure_aac_enc_format((audio_aac_encoder_config *) codec_info);
+            if (is_aac_vbr_enabled)
+                is_configured = configure_aac_enc_format_v3((audio_aac_encoder_config_v3 *) codec_info);
+            else
+                is_configured = is_aac_frame_ctl_enabled ?
+                                configure_aac_enc_format_v2((audio_aac_encoder_config_v2 *) codec_info) :
+                                configure_aac_enc_format((audio_aac_encoder_config *) codec_info);
             break;
         case CODEC_TYPE_CELT:
             ALOGD(" Received CELT encoder supported BT device");
@@ -2441,6 +2524,7 @@ int a2dp_start_playback()
         if (ret != 0 ) {
            ALOGE("BT controller start failed");
            a2dp.a2dp_source_started = false;
+           ret = -ETIMEDOUT;
         } else {
            if (configure_a2dp_encoder_format() == true) {
                 a2dp.a2dp_source_started = true;
@@ -2792,8 +2876,10 @@ int a2dp_set_parameters(struct str_parms *parms, bool *reconfig)
                     goto param_handled;
                 list_for_each(node, &a2dp.adev->usecase_list) {
                     uc_info = node_to_item(node, struct audio_usecase, list);
-                    if (uc_info->stream.out && uc_info->type == PCM_PLAYBACK &&
-                         (uc_info->stream.out->devices & AUDIO_DEVICE_OUT_ALL_A2DP)) {
+                    if (uc_info->type == PCM_PLAYBACK &&
+                        (uc_info->out_snd_device == SND_DEVICE_OUT_BT_A2DP ||
+                         uc_info->out_snd_device == SND_DEVICE_OUT_SPEAKER_AND_BT_A2DP ||
+                         uc_info->out_snd_device == SND_DEVICE_OUT_SPEAKER_SAFE_AND_BT_A2DP)) {
                         pthread_mutex_unlock(&a2dp.adev->lock);
                         fp_check_a2dp_restore(a2dp.adev, uc_info->stream.out, false);
                         pthread_mutex_lock(&a2dp.adev->lock);
@@ -2834,7 +2920,7 @@ int a2dp_set_parameters(struct str_parms *parms, bool *reconfig)
                 list_for_each(node, &a2dp.adev->usecase_list) {
                     uc_info = node_to_item(node, struct audio_usecase, list);
                     if (uc_info->stream.out && uc_info->type == PCM_PLAYBACK &&
-                         (uc_info->stream.out->devices & AUDIO_DEVICE_OUT_ALL_A2DP)) {
+                        is_a2dp_out_device_type(&uc_info->stream.out->device_list)) {
                         pthread_mutex_unlock(&a2dp.adev->lock);
                         fp_check_a2dp_restore(a2dp.adev, uc_info->stream.out, true);
                         pthread_mutex_lock(&a2dp.adev->lock);
